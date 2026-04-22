@@ -1,0 +1,7 @@
+# ignore datasets, which are too large to be tracked in git
+datasets/
+yolov8x.pt
+yolov8n.pt
+genie_results.csv
+detection_costs.csv
+cache_yolo_results/

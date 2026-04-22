@@ -1,14 +1,13 @@
 import numpy as np
 import torch
+import os
 import torchvision
 import bisect
 import glob
 from ultralytics import YOLO
-from metrics import extract_confidence_detection, weighted_confidence_detection, extract_comprehensive_detection_metric
+from precompute import check_cache, get_cached_data
+check_cache()  # Ensure cache is ready before evaluation
 
-# ============================================================
-# HIL-F: Hierarchical Inference Learning (Full Feedback)
-# ============================================================
 
 class HIL_F:
     def __init__(self, n_samples, beta=0.5):
@@ -39,6 +38,7 @@ class HIL_F:
         q_t = np.clip(q_t, 0.0, 1.0)
 
         accept_sml = np.random.rand() < q_t
+
         return accept_sml, q_t
 
     def update(self, p_t, y_t):
@@ -48,26 +48,15 @@ class HIL_F:
             self.boundaries.insert(idx, p_t)
             self.weights.insert(idx, self.weights[idx - 1])
 
-        # Exponential weight update
         for i in range(len(self.weights)):
             b_low = self.boundaries[i]
-
             if b_low >= p_t:
-                loss = self.beta  # would offload
+                loss = self.beta 
             else:
-                loss = y_t        # would accept
+                loss = y_t
 
             self.weights[i] *= np.exp(-self.eta * loss)
 
-# ============================================================
-# Confidence Metric (Detection)
-# ============================================================
-
-confidence_metric = weighted_confidence_detection
-
-# ============================================================
-# Box IoU
-# ============================================================
 
 def box_iou(boxA, boxB):
     xA = max(boxA[0], boxB[0])
@@ -81,17 +70,10 @@ def box_iou(boxA, boxB):
 
     return inter / union if union > 0 else 0.0
 
-
 # ============================================================
 # Detection Cost Function
 # ============================================================
-def calculate_detection_cost(sml_results, lml_results, iou_threshold=0.5):
-    """
-    Returns:
-        0.0 -> S-ML matches L-ML
-        1.0 -> mismatch
-    """
-
+def calculate_detection_cost(sml_results, lml_results, iou_threshold=0.45):
     sml_boxes = sml_results[0].boxes
     lml_boxes = lml_results[0].boxes
 
@@ -119,82 +101,21 @@ def calculate_detection_cost(sml_results, lml_results, iou_threshold=0.5):
     # Require all L-ML detections to be matched
     return 0.0 if matched == len(lml_xyxy) else 1.0
 
+def weakest_link_confidence(results):
+    """
+    Image-level confidence based on weakest detected object.
+    """
+    if not results or len(results[0].boxes) == 0:
+        return 0.0
 
-# ============================================================
-# Main Simulation Loop
-# ============================================================
+    confs = results[0].boxes.conf.cpu().numpy()
+    p_t = np.min(confs)
+    return float(p_t)
+
+confidence_metric = weakest_link_confidence
 
 def run_hierarchical_inference_simulation(image_paths):
-    print("Loading YOLOv8 detection models...")
-
-    # Detection models (NOT segmentation)
-    s_ml = YOLO('yolov8n.pt')  # Edge model
-    l_ml = YOLO('yolov8x.pt')  # Server model
-
-    n_samples = len(image_paths)
-    beta = 0.5
-
-    hil_f = HIL_F(n_samples=n_samples, beta=beta)
-
-    total_cost = 0.0
-    offloads = 0
-    accepted_incorrect_cost = 0
-    for t, img_path in enumerate(image_paths):
-        # --- 1. Local inference ---
-        sml_results = s_ml.predict(img_path, verbose=False)
-        # --- 2. Confidence ---
-        # p_t = extract_confidence_detection(sml_results)
-        p_t = confidence_metric(sml_results)  # alternative metric
-        # --- 3. Decision ---
-        accept_sml, q_t = hil_f.get_decision(p_t)
-        # --- 4. Execute + evaluate ---
-        lml_results = l_ml.predict(img_path, verbose=False)
-        y_t = calculate_detection_cost(sml_results, lml_results)
-            
-        if accept_sml:
-            step_cost = y_t
-            action = "ACCEPTED "
-            accepted_incorrect_cost += y_t
-        else:
-            step_cost = beta
-            offloads += 1
-            action = "OFFLOADED"
-        total_cost += step_cost
-        # --- 5. Update ---
-        hil_f.update(p_t, y_t)
-
-        print(f"Sample {t+1:02d}/{n_samples} | p_t: {p_t:.3f} | q_t: {q_t:.3f} | Action: {action} | Y_t: {y_t}")
-
-    print("\n--- Simulation Complete ---")
-    print(f"Total Images: {n_samples}")
-    print(f"Offloaded: {offloads} ({(offloads/n_samples)*100:.1f}%)")
-    print(f"Average Cost: {total_cost / n_samples:.3f}")
-    # """Calculate the accuracy score i.e out of all the accpted samples how many were correct (y_t = 0)"""
-
-    accepted_samples = n_samples - offloads
-    correct_accepts = accepted_samples - accepted_incorrect_cost
-    accuracy = correct_accepts / accepted_samples if accepted_samples > 0 else 0.0
-    print(f"Accuracy of accepted samples: {accuracy*100:.1f}%")
-
-
-# ============================================================
-# Entry Point
-# ============================================================
-
-if __name__ == "__main__":
-    image_paths = sorted(glob.glob("datasets/coco_images/val2017/*.jpg"))[0:50]
-
-    if not image_paths:
-        print("Error: No images found.")
-        quit()
-    else:
-        print(f"Loaded {len(image_paths)} images. Starting simulation...\n")
-    
-        print("Loading YOLOv8 detection models...")
-
-    # Detection models (NOT segmentation)
-    s_ml = YOLO('yolov8n.pt')  # Edge model
-    l_ml = YOLO('yolov8x.pt')  # Server model
+    device = torch.device("mps")
 
     n_samples = len(image_paths)
     beta = 0.5
@@ -206,16 +127,12 @@ if __name__ == "__main__":
     accepted_incorrect_cost = 0
     incorrect_count = 0
     for t, img_path in enumerate(image_paths):
-        # --- 1. Local inference ---
-        sml_results = s_ml.predict(img_path, verbose=False)
-        # --- 2. Confidence ---
-        # p_t = extract_confidence_detection(sml_results)
-        p_t = confidence_metric(sml_results)  # alternative metric
-        # --- 3. Decision ---
-        accept_sml, q_t = hil_f.get_decision(p_t)
-        # --- 4. Execute + evaluate ---
-        lml_results = l_ml.predict(img_path, verbose=False)
+        cached_data = get_cached_data(img_path)
+        sml_results = cached_data['yolov8n_coco']
+        lml_results = cached_data['yolov8x_coco']
         y_t = calculate_detection_cost(sml_results, lml_results)
+        p_t = confidence_metric(sml_results) 
+        accept_sml, q_t = hil_f.get_decision(p_t)
         incorrect_count += y_t
         if accept_sml:
             step_cost = y_t
@@ -226,22 +143,29 @@ if __name__ == "__main__":
             offloads += 1
             action = "OFFLOADED"
         total_cost += step_cost
-        # --- 5. Update ---
+
         hil_f.update(p_t, y_t)
+        if accept_sml and y_t == 0:
+            choice = "Good"
+        elif not accept_sml and y_t == 1:
+            choice = "Good"
+        else:
+            choice = "Bad"
 
-        print(f"Sample {t+1:02d}/{n_samples} | p_t: {p_t:.3f} | q_t: {q_t:.3f} | Action: {action} | Y_t: {y_t}")
+        print(f"Sample {t+1:02d}/{n_samples} | p_t: {p_t:.3f} | q_t: {q_t:.3f} | Action: {action} | Y_t: {y_t} | {choice}" )
 
-    print("\n--- Simulation Complete ---")
     print(f"Total Images: {n_samples}")
     print(f"Offloaded: {offloads} ({(offloads/n_samples)*100:.1f}%)")
     print(f"Average Cost: {total_cost / n_samples:.3f}")
-    # print(f"Incorrect Predictions: {incorrect_count}")
-    # """Calculate the accuracy score i.e out of all the accpted samples how many were correct (y_t = 0)"""
-
     accepted_samples = n_samples - offloads
     correct_accepts = accepted_samples - accepted_incorrect_cost
     accuracy = correct_accepts / accepted_samples if accepted_samples > 0 else 0.0
     print(f"Accuracy of accepted samples: {accuracy*100:.1f}%")
-
+    
     accuracy_of_sml = (n_samples - incorrect_count) / n_samples 
-    print(f"Overall S-ML Accuracy: {accuracy_of_sml*100:.1f}%")
+    print(f"S-ML accuracy on this dataset: {accuracy_of_sml*100:.1f}%")
+
+
+if __name__ == "__main__":
+    image_paths = sorted(glob.glob("datasets/coco_images/val2017/*.jpg"))[0:5000]
+    run_hierarchical_inference_simulation(image_paths)
