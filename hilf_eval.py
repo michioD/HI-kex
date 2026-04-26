@@ -87,7 +87,11 @@ def calculate_detection_cost_full(sml_results, lml_results, iou_threshold=0.5):
     
     # 1. Cardinality Check
     if len(s_boxes) != len(l_boxes):
-        return 1.0, 0.0, 0.0, 0.0
+        Y_t = 1.0
+        if len(s_boxes) > len(l_boxes):
+            fp = 1.0
+        else:            
+            fn = 1.0
     
     # Base case: both empty is a success
     if len(s_boxes) == 0:
@@ -116,7 +120,8 @@ def calculate_detection_cost_full(sml_results, lml_results, iou_threshold=0.5):
 
         # Check if spatial match exists
         if match_idx == -1 or best_iou < iou_threshold:
-            return 1.0, 0.0, 1.0, 0.0 # Error: Missing detection
+            Y_t = 1.0
+            fn = 1.0
             
         # 3. Check if classification matches for the pair
         if s_cls[match_idx] != l_cls[i]:
